@@ -46,7 +46,7 @@ use helix_core::{
 };
 use helix_view::{
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
-    editor::{Action, Motion},
+    editor::{Action, CloseError, Motion},
     expansion,
     info::Info,
     input::KeyEvent,
@@ -66,6 +66,7 @@ use crate::{
     compositor::{self, Component, Compositor},
     filter_picker_entry,
     job::Callback,
+    key,
     ui::{self, overlay::overlaid, Picker, PickerColumn, Popup, Prompt, PromptEvent},
 };
 
@@ -3298,23 +3299,23 @@ fn buffer_picker(cx: &mut Context) {
         focused_at: std::time::Instant,
     }
 
-    let new_meta = |doc: &Document| BufferMeta {
-        id: doc.id(),
-        path: doc.path().cloned(),
-        is_modified: doc.is_modified(),
-        is_current: doc.id() == current,
-        focused_at: doc.focused_at,
-    };
+    fn collect_buffers(editor: &Editor, current: DocumentId) -> Vec<BufferMeta> {
+        let mut items: Vec<BufferMeta> = editor
+            .documents
+            .values()
+            .map(|doc| BufferMeta {
+                id: doc.id(),
+                path: doc.path().cloned(),
+                is_modified: doc.is_modified(),
+                is_current: doc.id() == current,
+                focused_at: doc.focused_at,
+            })
+            .collect();
+        items.sort_unstable_by_key(|item| std::cmp::Reverse(item.focused_at));
+        items
+    }
 
-    let mut items = cx
-        .editor
-        .documents
-        .values()
-        .map(new_meta)
-        .collect::<Vec<BufferMeta>>();
-
-    // mru
-    items.sort_unstable_by_key(|item| std::cmp::Reverse(item.focused_at));
+    let items = collect_buffers(cx.editor, current);
 
     let columns = [
         PickerColumn::new("id", |meta: &BufferMeta, _| meta.id.to_string().into()),
@@ -3365,6 +3366,43 @@ fn buffer_picker(cx: &mut Context) {
             (cursor_line, cursor_line)
         });
         Some((meta.id.into(), lines))
+    })
+    // Press Delete on a highlighted buffer to close it. Modified buffers are
+    // refused (matching `:bc`'s default behaviour) — the user has to save
+    // first or close via `:bc!`. After a successful close we rebuild the
+    // picker items so the closed buffer disappears from the list.
+    .with_key_handler(key!(Delete), |cx, meta: &BufferMeta| {
+        let id = meta.id;
+        match cx.editor.close_document(id, false) {
+            Ok(()) => ui::PickerKeyAction::Refresh,
+            Err(CloseError::DoesNotExist) => {
+                // Can only happen if the buffer was closed out from under us.
+                ui::PickerKeyAction::Refresh
+            }
+            Err(CloseError::BufferModified(name)) => {
+                cx.editor.set_error(format!(
+                    "Buffer {:?} is modified — save it or force-close with :bc!",
+                    name
+                ));
+                ui::PickerKeyAction::Nothing
+            }
+            Err(CloseError::SaveError(err)) => {
+                cx.editor
+                    .set_error(format!("Could not close buffer: {}", err));
+                ui::PickerKeyAction::Nothing
+            }
+        }
+    })
+    .with_refresh_fn(move |editor, _| {
+        // `current` is captured from when the picker opened; after a close
+        // the active doc may have changed, so re-resolve it each refresh so
+        // the `*` current-buffer flag stays accurate.
+        let current = editor
+            .tree
+            .try_get(editor.tree.focus)
+            .map(|view| view.doc)
+            .unwrap_or(current);
+        collect_buffers(editor, current)
     });
     cx.push_layer(Box::new(overlaid(picker)));
 }

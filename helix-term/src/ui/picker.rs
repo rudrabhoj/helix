@@ -47,6 +47,7 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    input::KeyEvent,
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -238,6 +239,25 @@ impl<T, D> Column<T, D> {
 type DynQueryCallback<T, D> =
     fn(&str, &mut Editor, Arc<D>, &Injector<T, D>) -> BoxFuture<'static, anyhow::Result<()>>;
 
+/// The outcome of a [`PickerKeyHandler`], signalling what the picker should do
+/// after the handler has run.
+pub enum PickerKeyAction {
+    /// Keep the picker open with its current items.
+    Nothing,
+    /// Close the picker.
+    Close,
+    /// Rebuild the picker's item list by calling the registered refresh fn
+    /// (see [`Picker::with_refresh_fn`]). A no-op if no refresh fn is set.
+    Refresh,
+}
+
+/// A handler registered with [`Picker::with_key_handler`]. Invoked when the
+/// bound key is pressed while the picker is open and an item is selected.
+pub type PickerKeyHandler<T> = Box<dyn Fn(&mut Context, &T) -> PickerKeyAction>;
+
+/// Rebuilds the picker's item list from the current editor state.
+type PickerRefreshFn<T, D> = Box<dyn Fn(&Editor, &D) -> Vec<T>>;
+
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     columns: Arc<[Column<T, D>]>,
     primary_column: usize,
@@ -259,6 +279,14 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
+
+    /// Custom key handlers invoked after the built-in picker keys have been
+    /// checked. Register with [`Self::with_key_handler`].
+    custom_key_handlers: HashMap<KeyEvent, PickerKeyHandler<T>>,
+    /// Optional function that rebuilds the item list from the current editor
+    /// state. Invoked when a custom key handler returns
+    /// [`PickerKeyAction::Refresh`]. Register with [`Self::with_refresh_fn`].
+    refresh_fn: Option<PickerRefreshFn<T, D>>,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -387,6 +415,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             show_preview: true,
             callback_fn: Box::new(callback_fn),
             default_action: Action::Replace,
+            custom_key_handlers: HashMap::new(),
+            refresh_fn: None,
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -453,6 +483,49 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn with_default_action(mut self, action: Action) -> Self {
         self.default_action = action;
         self
+    }
+
+    /// Register a handler that runs when `key` is pressed inside the picker.
+    ///
+    /// Built-in picker keys (navigation, Enter, Esc, splits, preview toggle,
+    /// etc.) still take precedence — custom handlers are only consulted for
+    /// keys that are not handled by the picker itself. Handler is invoked with
+    /// a reference to the currently selected item; if nothing is selected the
+    /// handler does not fire.
+    pub fn with_key_handler<F>(mut self, key: KeyEvent, handler: F) -> Self
+    where
+        F: Fn(&mut Context, &T) -> PickerKeyAction + 'static,
+    {
+        self.custom_key_handlers.insert(key, Box::new(handler));
+        self
+    }
+
+    /// Register a function that rebuilds the picker's items from the current
+    /// editor state. Called whenever a custom key handler returns
+    /// [`PickerKeyAction::Refresh`].
+    pub fn with_refresh_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Editor, &D) -> Vec<T> + 'static,
+    {
+        self.refresh_fn = Some(Box::new(f));
+        self
+    }
+
+    /// Replace the picker's items using the registered refresh fn. The cursor
+    /// is clamped into the new item range on the next render tick.
+    fn refresh_items(&mut self, editor: &Editor) {
+        let Some(refresh_fn) = self.refresh_fn.as_ref() else {
+            return;
+        };
+        let items = refresh_fn(editor, &self.editor_data);
+        // Drop the old items and disconnect any outstanding injectors, then
+        // reinject the fresh list. `restart(true)` also clears the snapshot
+        // so stale matches aren't shown during the next tick.
+        self.matcher.restart(true);
+        let injector = self.matcher.injector();
+        for item in items {
+            inject_nucleo_item(&injector, &self.columns, item, &self.editor_data);
+        }
     }
 
     /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
@@ -1160,7 +1233,25 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                 self.toggle_preview();
             }
             _ => {
-                self.prompt_handle_event(event, ctx);
+                // Check for a custom key handler before forwarding the event
+                // to the prompt. Handlers require a selected item; if none is
+                // selected we fall through to the prompt just as with any
+                // other unbound key.
+                let action = if self.custom_key_handlers.contains_key(&key_event) {
+                    let handler = &self.custom_key_handlers[&key_event];
+                    self.selection().map(|item| handler(ctx, item))
+                } else {
+                    None
+                };
+
+                match action {
+                    Some(PickerKeyAction::Nothing) => {}
+                    Some(PickerKeyAction::Close) => return close_fn(self),
+                    Some(PickerKeyAction::Refresh) => self.refresh_items(ctx.editor),
+                    None => {
+                        self.prompt_handle_event(event, ctx);
+                    }
+                }
             }
         }
 
